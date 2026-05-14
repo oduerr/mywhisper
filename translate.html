@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realtime Translator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0f172a;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    /* ── Setup panel ──────────────────────────────────────────────── */
+    .setup-card {
+      width: 380px;
+      background: #1e293b;
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    }
+    .setup-card h1 { font-size: 20px; font-weight: 600; color: #f1f5f9; margin-bottom: 6px; }
+    .subtitle      { font-size: 12px; color: #64748b; margin-bottom: 28px; }
+    label {
+      display: block; font-size: 12px; font-weight: 500;
+      color: #94a3b8; margin: 16px 0 6px;
+    }
+    input[type="password"], select {
+      width: 100%; background: #0f172a; border: 1px solid #334155;
+      border-radius: 8px; padding: 10px 12px; color: #e2e8f0;
+      font-size: 14px; outline: none; transition: border-color .15s;
+    }
+    input[type="password"]:focus, select:focus { border-color: #3b82f6; }
+    select option { background: #1e293b; }
+    .connect-btn {
+      width: 100%; margin-top: 24px; padding: 12px; background: #3b82f6;
+      color: #fff; border: none; border-radius: 8px; font-size: 14px;
+      font-weight: 500; cursor: pointer; transition: background .15s;
+    }
+    .connect-btn:hover    { background: #2563eb; }
+    .connect-btn:disabled { background: #1e3a5f; color: #64748b; cursor: not-allowed; }
+    #errorMsg {
+      margin-top: 10px; font-size: 12px; color: #ef4444; min-height: 18px;
+      word-break: break-word;
+    }
+    .notice {
+      margin-top: 16px; font-size: 11px; color: #475569;
+      background: #0f172a; border-radius: 6px; padding: 9px 11px;
+      line-height: 1.55;
+    }
+
+    /* ── Main panel ───────────────────────────────────────────────── */
+    .main-card {
+      width: 400px; background: #1e293b;
+      border-radius: 16px; overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    }
+    .card-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 11px 14px; background: #0f172a;
+    }
+    #statusDot {
+      width: 9px; height: 9px; border-radius: 50%;
+      flex-shrink: 0; transition: background .2s;
+    }
+    #statusLabel {
+      flex: 1; font-size: 11px; color: #64748b; transition: color .2s;
+    }
+    #langLabel { font-size: 11px; color: #334155; }
+    #disconnectBtn {
+      background: none; border: none; color: #334155;
+      font-size: 20px; cursor: pointer; line-height: 1;
+      padding: 0 2px; transition: color .15s;
+    }
+    #disconnectBtn:hover { color: #94a3b8; }
+
+    #barsCanvas { display: block; width: 100%; }
+
+    .sep { height: 1px; background: #0f172a; margin: 0 14px; }
+
+    .transcript-wrap {
+      min-height: 44px; padding: 10px 14px;
+      font-size: 13px; line-height: 1.5; cursor: pointer;
+      transition: color .15s;
+    }
+    .transcript-wrap          { color: #475569; }
+    .transcript-wrap.has-text { color: #64748b; }
+    .transcript-wrap.active   { color: #e2e8f0; }
+    .transcript-wrap:hover    { color: #93c5fd; }
+    .transcript-placeholder   { font-style: italic; color: #334155; }
+
+    .talk-area {
+      padding: 14px 14px 18px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+    }
+    #talkBtn {
+      width: 100%; padding: 14px;
+      background: #1e293b; border: 2px solid #334155; border-radius: 10px;
+      color: #94a3b8; font-size: 14px; font-weight: 500;
+      cursor: pointer; user-select: none; transition: all .1s;
+    }
+    #talkBtn:hover        { border-color: #475569; }
+    #talkBtn.recording    { background: #7f1d1d; border-color: #ef4444; color: #fca5a5; }
+    .key-hint { font-size: 11px; color: #334155; }
+    #copyBtn {
+      padding: 6px 14px; background: none; border: 1px solid #334155;
+      border-radius: 6px; color: #94a3b8; font-size: 12px; cursor: pointer;
+      transition: all .15s;
+    }
+    #copyBtn:hover { border-color: #22c55e; color: #22c55e; }
+  </style>
+</head>
+<body>
+
+<!-- ── Setup ─────────────────────────────────────────────────────────── -->
+<div id="setupPanel">
+  <div class="setup-card">
+    <h1>Realtime Translator</h1>
+    <p class="subtitle">Speech → speech translation via OpenAI gpt-realtime-translate</p>
+
+    <label for="apiKey">OpenAI API Key</label>
+    <input type="password" id="apiKey" placeholder="sk-…" autocomplete="off" spellcheck="false">
+
+    <label for="lang">Target Language</label>
+    <select id="lang">
+      <option value="zh">Chinese (中文)</option>
+      <option value="en">English</option>
+      <option value="fr">French (Français)</option>
+      <option value="de">German (Deutsch)</option>
+      <option value="es">Spanish (Español)</option>
+      <option value="it">Italian (Italiano)</option>
+      <option value="pt">Portuguese (Português)</option>
+      <option value="fi">Finnish (Suomi)</option>
+    </select>
+
+    <button class="connect-btn" id="connectBtn">Connect</button>
+    <p id="errorMsg"></p>
+    <p class="notice">
+      Your API key is sent only to <strong>api.openai.com</strong> and never stored.
+      Serve this file via a local HTTP server if you see a CORS error opening it as
+      <code>file://</code> (e.g. <code>python -m http.server 8000</code>).
+    </p>
+  </div>
+</div>
+
+<!-- ── Main ──────────────────────────────────────────────────────────── -->
+<div id="mainPanel" style="display:none">
+  <div class="main-card">
+    <div class="card-header">
+      <div id="statusDot"></div>
+      <span id="statusLabel"></span>
+      <span id="langLabel"></span>
+      <button id="disconnectBtn" title="Disconnect">×</button>
+    </div>
+
+    <canvas id="barsCanvas" width="400" height="72"></canvas>
+
+    <div class="sep"></div>
+
+    <div class="transcript-wrap" id="transcriptEl" title="Click to replay">
+      <span class="transcript-placeholder">Translation will appear here · click to replay</span>
+    </div>
+
+    <div class="talk-area">
+      <button id="talkBtn">Hold to Translate</button>
+      <span class="key-hint">or hold Space bar</span>
+      <button id="copyBtn" style="display:none">Copy translation</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── Constants ──────────────────────────────────────────────────────────────────
+const SDP_URL = 'https://api.openai.com/v1/realtime/translations/calls';
+const MODEL   = 'gpt-realtime-translate';
+const BAR_N   = 48;
+const BG      = '#0f172a';
+const STATES  = {
+  idle:        { dot: '#22c55e', label: '#64748b', bar: '#1e3a5f' },
+  recording:   { dot: '#ef4444', label: '#ef4444', bar: '#7f1d1d' },
+  translating: { dot: '#f59e0b', label: '#f59e0b', bar: '#78350f' },
+  playing:     { dot: '#a855f7', label: '#a855f7', bar: '#3b0764' },
+};
+const LABELS = {
+  idle:        'Ready · hold button or Space to record',
+  recording:   'Recording & translating…',
+  translating: 'Finishing…',
+  playing:     'Playing translation…',
+};
+const LANG_LABEL = {
+  en: '→ English',    fr: '→ Français',  zh: '→ 中文',
+  fi: '→ Suomi',      es: '→ Español',   it: '→ Italiano',
+  pt: '→ Português',  de: '→ Deutsch',
+};
+
+// ── State ──────────────────────────────────────────────────────────────────────
+let appState    = 'idle';
+let pc          = null;
+let dataCh      = null;
+let micStream   = null;
+let micTrack    = null;
+let micAudioCtx = null;
+let micAnalyser = null;
+let capAudioCtx = null;   // separate context for capturing remote audio
+let capNode     = null;   // ScriptProcessorNode on remote stream
+let remoteAudio = null;   // <Audio> element for playback
+let animId      = null;
+let transcript  = '';
+let replayBufs  = [];     // Float32Array chunks of remote audio (for replay)
+let lastEvMs    = 0;      // timestamp of last translation event
+let releaseMs   = 0;      // timestamp of button/key release
+let levels      = new Array(BAR_N).fill(0);
+let rmsLevel    = 0;
+let phase       = 0;
+
+// ── DOM ────────────────────────────────────────────────────────────────────────
+const setupPanel   = document.getElementById('setupPanel');
+const mainPanel    = document.getElementById('mainPanel');
+const connectBtn   = document.getElementById('connectBtn');
+const apiKeyInput  = document.getElementById('apiKey');
+const langSelect   = document.getElementById('lang');
+const errorMsg     = document.getElementById('errorMsg');
+const statusDot    = document.getElementById('statusDot');
+const statusLabel  = document.getElementById('statusLabel');
+const langLabel    = document.getElementById('langLabel');
+const disconnectBtn= document.getElementById('disconnectBtn');
+const canvas       = document.getElementById('barsCanvas');
+const transcriptEl = document.getElementById('transcriptEl');
+const talkBtn      = document.getElementById('talkBtn');
+const copyBtn      = document.getElementById('copyBtn');
+const ctx2d        = canvas.getContext('2d');
+
+// ── Connect ────────────────────────────────────────────────────────────────────
+connectBtn.addEventListener('click', connect);
+apiKeyInput.addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+
+async function connect() {
+  const apiKey = apiKeyInput.value.trim();
+  if (!apiKey) { showError('Please enter your OpenAI API key.'); return; }
+
+  connectBtn.disabled = true;
+  connectBtn.textContent = 'Connecting…';
+  clearError();
+
+  // 1. Microphone access
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+    }});
+  } catch (e) {
+    showError('Microphone denied: ' + e.message);
+    resetConnectBtn(); return;
+  }
+  micTrack = micStream.getAudioTracks()[0];
+  micTrack.enabled = false; // muted until user holds button
+
+  // Mic level meter (runs always for idle visualisation)
+  micAudioCtx = new AudioContext();
+  // Chrome may suspend AudioContext after the await above (async gap breaks gesture
+  // propagation). Resume explicitly before wiring the graph.
+  await micAudioCtx.resume();
+  const micSrc = micAudioCtx.createMediaStreamSource(micStream);
+  micAnalyser = micAudioCtx.createAnalyser();
+  micAnalyser.fftSize = 256;
+  micAnalyser.smoothingTimeConstant = 0.75;
+  // Chrome only processes nodes connected (even indirectly) to destination.
+  // A zero-gain node completes the chain without producing audible output.
+  const silentGain = micAudioCtx.createGain();
+  silentGain.gain.value = 0;
+  micSrc.connect(micAnalyser);
+  micAnalyser.connect(silentGain);
+  silentGain.connect(micAudioCtx.destination);
+
+  // 2. RTCPeerConnection
+  pc = new RTCPeerConnection();
+  dataCh = pc.createDataChannel('oai-events');
+  dataCh.onopen    = onDcOpen;
+  dataCh.onmessage = onDcMessage;
+  dataCh.onerror   = e => console.warn('[dataCh] error:', e);
+
+  pc.addTrack(micTrack, micStream);
+  pc.ontrack = onRemoteTrack;
+
+  // 3. SDP offer
+  let offer;
+  try {
+    offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+  } catch (e) {
+    showError('WebRTC offer failed: ' + e.message);
+    cleanup(); resetConnectBtn(); return;
+  }
+
+  // 4. Exchange SDP with OpenAI
+  let sdp;
+  try {
+    const resp = await fetch(`${SDP_URL}?model=${MODEL}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/sdp' },
+      body: offer.sdp,
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`${resp.status} ${resp.statusText} — ${body.slice(0, 200)}`);
+    }
+    sdp = await resp.text();
+  } catch (e) {
+    showError('API error: ' + e.message);
+    cleanup(); resetConnectBtn(); return;
+  }
+
+  try {
+    await pc.setRemoteDescription({ type: 'answer', sdp });
+  } catch (e) {
+    showError('SDP error: ' + e.message);
+    cleanup(); resetConnectBtn(); return;
+  }
+
+  // 5. Show main UI
+  langLabel.textContent = LANG_LABEL[langSelect.value] || '';
+  setupPanel.style.display = 'none';
+  mainPanel.style.display  = '';
+  setState('idle');
+  startAnimation();
+}
+
+// ── Data channel ───────────────────────────────────────────────────────────────
+function onDcOpen() {
+  dataCh.send(JSON.stringify({
+    type: 'session.update',
+    session: { audio: { output: { language: langSelect.value } } },
+  }));
+}
+
+function onDcMessage({ data }) {
+  let ev;
+  try { ev = JSON.parse(data); } catch { return; }
+  const t      = ev.type || '';
+  const active = ['recording','translating','playing'].includes(appState);
+
+  if (t === 'session.output_transcript.delta' && active) {
+    transcript += ev.delta || '';
+    renderTranscript();
+    if (appState === 'translating') setState('playing');
+    lastEvMs = Date.now();
+  } else if (t === 'session.output_transcript.done' && active) {
+    lastEvMs = Date.now();
+  } else if (t === 'error') {
+    console.error('[api] error event:', ev);
+  }
+}
+
+// ── Remote audio (translated speech) ──────────────────────────────────────────
+function onRemoteTrack({ streams }) {
+  const stream = streams[0];
+
+  // Play through <audio> element (simplest cross-browser approach)
+  if (!remoteAudio) remoteAudio = new Audio();
+  remoteAudio.srcObject = stream;
+  remoteAudio.play().catch(() => {});
+
+  // Capture chunks for replay via ScriptProcessorNode
+  // (deprecated but works inline without a separate Worklet file)
+  capAudioCtx = new AudioContext({ sampleRate: 24000 });
+  const remoteSrc = capAudioCtx.createMediaStreamSource(stream);
+  capNode = capAudioCtx.createScriptProcessor(4096, 1, 1);
+  remoteSrc.connect(capNode);
+  capNode.connect(capAudioCtx.destination);  // must be connected to fire
+  capNode.onaudioprocess = e => {
+    if (appState !== 'playing' && appState !== 'translating') return;
+    const f32 = e.inputBuffer.getChannelData(0);
+    // Skip silence
+    let sum = 0;
+    for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
+    if (Math.sqrt(sum / f32.length) < 0.001) return;
+    replayBufs.push(f32.slice());
+    lastEvMs = Date.now();
+    if (appState === 'translating') setState('playing');
+  };
+}
+
+// ── Push-to-talk ───────────────────────────────────────────────────────────────
+talkBtn.addEventListener('mousedown',  startRecord);
+talkBtn.addEventListener('mouseup',    stopRecord);
+talkBtn.addEventListener('mouseleave', e => { if (appState === 'recording') stopRecord(e); });
+talkBtn.addEventListener('touchstart', e => { e.preventDefault(); startRecord(e); }, { passive: false });
+talkBtn.addEventListener('touchend',   e => { e.preventDefault(); stopRecord(e); },  { passive: false });
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && e.target === document.body) {
+    if (['idle','translating','playing'].includes(appState)) { e.preventDefault(); startRecord(e); }
+  }
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'Space' && appState === 'recording') { e.preventDefault(); stopRecord(e); }
+});
+
+function startRecord() {
+  if (!['idle','translating','playing'].includes(appState)) return;
+  transcript  = '';
+  replayBufs  = [];
+  copyBtn.style.display = 'none';
+  copyBtn.textContent   = 'Copy translation';
+  micTrack.enabled = true;
+  setState('recording');
+  talkBtn.classList.add('recording');
+}
+
+function stopRecord() {
+  if (appState !== 'recording') return;
+  micTrack.enabled = false;
+  releaseMs = Date.now();
+  lastEvMs  = Date.now();
+  setState('translating');
+  talkBtn.classList.remove('recording');
+}
+
+// ── Replay ─────────────────────────────────────────────────────────────────────
+transcriptEl.addEventListener('click', () => {
+  if (replayBufs.length === 0 || appState !== 'idle') return;
+
+  let total = 0;
+  for (const b of replayBufs) total += b.length;
+  const combined = new Float32Array(total);
+  let off = 0;
+  for (const b of replayBufs) { combined.set(b, off); off += b.length; }
+
+  const ctx  = new AudioContext({ sampleRate: 24000 });
+  const buf  = ctx.createBuffer(1, combined.length, 24000);
+  buf.copyToChannel(combined, 0);
+  const src  = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  setState('playing');
+  src.start();
+  src.onended = () => { setState('idle'); ctx.close(); };
+});
+
+// ── State machine ──────────────────────────────────────────────────────────────
+function setState(s) {
+  appState = s;
+  const st = STATES[s];
+  if (!st) return;
+  statusDot.style.background = st.dot;
+  statusLabel.style.color    = st.label;
+  statusLabel.textContent    = LABELS[s] || '';
+  transcriptEl.classList.toggle('active', s !== 'idle');
+}
+
+function renderTranscript() {
+  transcriptEl.textContent = transcript.trim() || '';
+  transcriptEl.classList.toggle('has-text', transcript.trim().length > 0);
+}
+
+function finishUp() {
+  if (transcript.trim()) copyBtn.style.display = '';
+  setState('idle');
+}
+
+// Copy button — runs inside a real user gesture so Safari allows clipboard access
+copyBtn.addEventListener('click', () => {
+  const text = transcript.trim();
+  if (!text) return;
+  const write = () => {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).catch(fallbackCopy.bind(null, text));
+    } else {
+      fallbackCopy(text);
+    }
+    copyBtn.textContent = 'Copied!';
+    setTimeout(() => {
+      copyBtn.style.display = 'none';
+      copyBtn.textContent   = 'Copy translation';
+    }, 1500);
+  };
+  write();
+});
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;top:-9999px;opacity:0';
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  try { document.execCommand('copy'); } catch {}
+  document.body.removeChild(ta);
+}
+
+// ── Animation loop ─────────────────────────────────────────────────────────────
+function startAnimation() {
+  if (animId) cancelAnimationFrame(animId);
+  animId = requestAnimationFrame(tick);
+}
+
+function tick() {
+  phase = (phase + 4) % 360;
+
+  // Timeout transitions (mirrors Python's _maybe_finish)
+  const now = Date.now();
+  if      (appState === 'playing'     && now - lastEvMs  > 1200) finishUp();
+  else if (appState === 'translating' && now - releaseMs > 5000) finishUp();
+
+  // Sample RMS from mic (always, so we see activity in idle state too)
+  if (micAnalyser) {
+    const td = new Uint8Array(micAnalyser.frequencyBinCount);
+    micAnalyser.getByteTimeDomainData(td);
+    let s = 0;
+    for (let i = 0; i < td.length; i++) { const v = (td[i] - 128) / 128; s += v * v; }
+    rmsLevel = Math.sqrt(s / td.length);
+  }
+
+  drawBars();
+  animId = requestAnimationFrame(tick);
+}
+
+// ── Canvas drawing ─────────────────────────────────────────────────────────────
+function drawBars() {
+  const W = canvas.width, H = canvas.height;
+  const st  = STATES[appState] || STATES.idle;
+  const bw  = W / BAR_N;
+  const bmax = H - 4;
+
+  ctx2d.fillStyle = BG;
+  ctx2d.fillRect(0, 0, W, H);
+
+  if (appState === 'translating' || appState === 'playing') {
+    // Sine-wave animation
+    for (let i = 0; i < BAR_N; i++) {
+      const wave = 0.5 + 0.5 * Math.sin((phase + i * (360 / BAR_N)) * Math.PI / 180);
+      const h    = Math.max(2, wave * bmax * 0.55);
+      ctx2d.fillStyle = st.bar;
+      ctx2d.fillRect(i * bw + 0.8, H - h, bw - 1.6, h);
+    }
+    return;
+  }
+
+  // Scrolling RMS bars (idle / recording)
+  const newVal = levels[BAR_N - 1] * 0.8 + rmsLevel * 0.2;
+  levels.shift();
+  levels.push(newVal);
+
+  for (let i = 0; i < BAR_N; i++) {
+    const lv = levels[i];
+    const h  = Math.max(2, Math.min(bmax, lv * bmax * 18));
+    let color;
+    if (appState === 'recording') {
+      const t = Math.min(1, lv * 22);
+      color = `rgb(${Math.round(34+(239-34)*t)},${Math.round(197-(197-68)*t)},${Math.round(94-94*t)})`;
+    } else {
+      const t = Math.min(1, lv * 22);
+      color = `rgb(${Math.round(30+44*t)},${Math.round(58+96*t)},${Math.round(95+160*t)})`;
+    }
+    ctx2d.fillStyle = color;
+    ctx2d.fillRect(i * bw + 0.8, H - h, bw - 1.6, h);
+  }
+}
+
+// ── Disconnect / cleanup ───────────────────────────────────────────────────────
+disconnectBtn.addEventListener('click', disconnect);
+
+function disconnect() {
+  cleanup();
+  transcript = '';
+  transcriptEl.innerHTML = '<span class="transcript-placeholder">Translation will appear here · click to replay</span>';
+  copyBtn.style.display    = 'none';
+  copyBtn.textContent      = 'Copy translation';
+  mainPanel.style.display  = 'none';
+  setupPanel.style.display = '';
+  resetConnectBtn();
+}
+
+function cleanup() {
+  if (animId)      { cancelAnimationFrame(animId); animId = null; }
+  if (dataCh)      { try { dataCh.close(); }         catch {} dataCh = null; }
+  if (pc)          { try { pc.close(); }              catch {} pc = null; }
+  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  micTrack = null;
+  if (micAudioCtx) { try { micAudioCtx.close(); }    catch {} micAudioCtx = null; }
+  micAnalyser = null;
+  if (capNode)     { capNode.disconnect(); capNode = null; }
+  if (capAudioCtx) { try { capAudioCtx.close(); }    catch {} capAudioCtx = null; }
+  if (remoteAudio) { remoteAudio.srcObject = null; remoteAudio = null; }
+  replayBufs = [];
+  appState = 'idle';
+}
+
+function showError(msg) { errorMsg.textContent = msg; }
+function clearError()   { errorMsg.textContent = ''; }
+function resetConnectBtn() {
+  connectBtn.disabled = false;
+  connectBtn.textContent = 'Connect';
+}
+</script>
+</body>
+</html>
