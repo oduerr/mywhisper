@@ -2,8 +2,14 @@
 """
 mywhisper — hold right-⌥ (right Option) to record, release to transcribe and paste.
 Change HOTKEY below to any pynput Key if you prefer a different key.
+
+Usage:
+    python app.py
+    python app.py --model mlx-community/whisper-large-v3
+    python app.py --help
 """
 
+import argparse
 import math
 import threading
 import time
@@ -16,8 +22,29 @@ import mlx_whisper
 from pynput import keyboard
 from pynput.keyboard import Controller as KBController, Key
 
+# ── CLI ────────────────────────────────────────────────────────────────────────
+_parser = argparse.ArgumentParser(
+    description="mywhisper — hold right-⌥ to record and paste transcription at cursor",
+    formatter_class=argparse.RawTextHelpFormatter,
+)
+_parser.add_argument(
+    "--model", default="mlx-community/whisper-large-v3-turbo",
+    metavar="HF_REPO",
+    help=(
+        "mlx-community HuggingFace model repo (default: whisper-large-v3-turbo).\n"
+        "Common choices:\n"
+        "  mlx-community/whisper-tiny          (fastest, lowest accuracy)\n"
+        "  mlx-community/whisper-small\n"
+        "  mlx-community/whisper-medium\n"
+        "  mlx-community/whisper-large-v3\n"
+        "  mlx-community/whisper-large-v3-turbo  (recommended)\n"
+        "Browse all: https://huggingface.co/collections/mlx-community/whisper-663256f9964fbb1177db93dc"
+    ),
+)
+_args = _parser.parse_args()
+
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL       = "mlx-community/whisper-large-v3-turbo"
+MODEL       = _args.model
 HOTKEY      = Key.alt_r          # right Option — easy to hold, rarely conflicts
 SAMPLE_RATE = 16000
 WIN_W       = 360
@@ -44,13 +71,14 @@ LABELS = {
 
 class MyWhisper:
     def __init__(self):
-        self.state     = "loading"
-        self._chunks   = []
+        self.state      = "loading"
+        self._chunks    = []
         self._recording = False
-        self._rms      = 0.0
-        self._levels   = [0.0] * BAR_N   # smoothed display levels
-        self._phase    = 0.0              # animation phase for loading/transcribing
-        self._kb       = KBController()
+        self._rms       = 0.0
+        self._levels    = [0.0] * BAR_N   # smoothed display levels
+        self._phase     = 0.0              # animation phase for loading/transcribing
+        self._last_time = None            # seconds taken for last transcription
+        self._kb        = KBController()
 
         self._build_ui()
         self._start_audio()
@@ -82,6 +110,11 @@ class MyWhisper:
         self._lbl = cv.create_text(PAD + 16, 15, text=LABELS["loading"],
                                    fill="#475569", font=("Helvetica Neue", 11),
                                    anchor="w")
+        # Model name — right-aligned, dim
+        short_model = MODEL.split("/")[-1]
+        self._model_lbl = cv.create_text(WIN_W - 26, 15, text=short_model, fill="#334155",
+                                         font=("Helvetica Neue", 10), anchor="e")
+
         # Close ×
         cv.create_text(WIN_W - 10, 14, text="×", fill="#334155",
                        font=("Helvetica Neue", 14), anchor="e", tags="close")
@@ -162,7 +195,9 @@ class MyWhisper:
             return
         audio = np.concatenate(self._chunks).astype(np.float32)
         try:
+            t0 = time.time()
             result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, verbose=False)
+            self._last_time = time.time() - t0
             text = result.get("text", "").strip()
             if text:
                 self._paste(text)
@@ -230,6 +265,9 @@ class MyWhisper:
 
         self.cv.itemconfig(self._dot, fill=dot_col)
         self.cv.itemconfig(self._lbl, text=LABELS[self.state], fill=txt_col)
+        short_model = MODEL.split("/")[-1]
+        if self._last_time is not None:
+            self.cv.itemconfig(self._model_lbl, text=f"{self._last_time:.1f}s  {short_model}")
         self.root.after(1000 // FPS, self._tick)
 
     # ── Quit ───────────────────────────────────────────────────────────────────
