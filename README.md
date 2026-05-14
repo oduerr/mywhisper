@@ -33,6 +33,29 @@ Without this you'll see `This process is not trusted!` and the hotkey won't work
 
 **2. Microphone** — macOS will prompt automatically on first use.
 
+## openai_translate.py
+
+Real-time German speech translator using the OpenAI Realtime Translate API (`gpt-realtime-translate`). Hold right ⌥, speak German, release — the translation is spoken aloud, pasted at the cursor, and shown in the UI.
+
+```bash
+python openai_translate.py                 # German → Chinese (default)
+python openai_translate.py --lang en       # German → English
+python openai_translate.py --lang fr       # German → French
+python openai_translate.py --help
+```
+
+Requires `OPENAI_API_KEY` to be set in your environment. Billed at $0.034/min of audio.
+
+Same macOS Accessibility permission as `mywhisper.py` applies here too.
+
+> **Known limitation:** audio is sent to the API only after you release the key (batch mode), so latency scales with recording length. A proper fix would stream audio to the API while you're still speaking — that's a future improvement.
+
+`test_translate.py` is a minimal script for testing the pipeline with a WAV file without the UI:</p>
+
+```bash
+python test_translate.py recordings/<folder>/output.wav zh
+```
+
 ## benchmark.py
 
 Internal script for evaluating mlx_whisper transcription quality against a set of reference recordings (from SuperWhisper). Not intended for general use — the `recordings/` directory is local-only and not checked in.
