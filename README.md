@@ -12,7 +12,7 @@ source .venv/bin/activate
 ## Running the app
 
 ```bash
-python app.py
+python mywhisper.py
 ```
 
 A small floating window appears in the bottom-right corner. Hold **right ⌥ (Option)** to record, release to transcribe — the text is pasted at the cursor position in whatever app is focused.
