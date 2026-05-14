@@ -210,12 +210,13 @@ let micStream   = null;
 let micTrack    = null;
 let micAudioCtx = null;
 let micAnalyser = null;
-let capAudioCtx = null;   // separate context for capturing remote audio
+let capAudioCtx = null;   // AudioContext for remote audio capture + scheduled playback
 let capNode     = null;   // ScriptProcessorNode on remote stream
-let remoteAudio = null;   // <Audio> element for playback
 let animId      = null;
 let transcript  = '';
 let replayBufs  = [];     // Float32Array chunks of remote audio (for replay)
+let audioQueue  = [];     // chunks buffered during recording, drained on release
+let nextPlayTime = 0;     // scheduled playback cursor in capAudioCtx time
 let lastEvMs    = 0;      // timestamp of last translation event
 let releaseMs   = 0;      // timestamp of button/key release
 let levels      = new Array(BAR_N).fill(0);
@@ -263,11 +264,14 @@ async function connect() {
   micTrack = micStream.getAudioTracks()[0];
   micTrack.enabled = false; // muted until user holds button
 
-  // Mic level meter (runs always for idle visualisation)
+  // Create both AudioContexts here while still in the async-gesture chain so
+  // Chrome doesn't suspend them. resume() forces active state in both browsers.
   micAudioCtx = new AudioContext();
-  // Chrome may suspend AudioContext after the await above (async gap breaks gesture
-  // propagation). Resume explicitly before wiring the graph.
   await micAudioCtx.resume();
+  capAudioCtx = new AudioContext({ sampleRate: 24000 });
+  await capAudioCtx.resume();
+
+  // Mic level meter (runs always for idle visualisation)
   const micSrc = micAudioCtx.createMediaStreamSource(micStream);
   micAnalyser = micAudioCtx.createAnalyser();
   micAnalyser.fftSize = 256;
@@ -363,29 +367,51 @@ function onDcMessage({ data }) {
 function onRemoteTrack({ streams }) {
   const stream = streams[0];
 
-  // Play through <audio> element (simplest cross-browser approach)
-  if (!remoteAudio) remoteAudio = new Audio();
-  remoteAudio.srcObject = stream;
-  remoteAudio.play().catch(() => {});
-
-  // Capture chunks for replay via ScriptProcessorNode
-  // (deprecated but works inline without a separate Worklet file)
-  capAudioCtx = new AudioContext({ sampleRate: 24000 });
+  // Route remote stream through ScriptProcessorNode so we control when audio
+  // plays. The node output goes to a silent gain (keeps the graph alive / RTCP
+  // flowing); audible playback happens via scheduled BufferSource nodes instead.
   const remoteSrc = capAudioCtx.createMediaStreamSource(stream);
   capNode = capAudioCtx.createScriptProcessor(4096, 1, 1);
+  const capSilence = capAudioCtx.createGain();
+  capSilence.gain.value = 0;
   remoteSrc.connect(capNode);
-  capNode.connect(capAudioCtx.destination);  // must be connected to fire
+  capNode.connect(capSilence);
+  capSilence.connect(capAudioCtx.destination);
+
   capNode.onaudioprocess = e => {
-    if (appState !== 'playing' && appState !== 'translating') return;
-    const f32 = e.inputBuffer.getChannelData(0);
-    // Skip silence
-    let sum = 0;
-    for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
-    if (Math.sqrt(sum / f32.length) < 0.001) return;
-    replayBufs.push(f32.slice());
-    lastEvMs = Date.now();
-    if (appState === 'translating') setState('playing');
+    const f32 = e.inputBuffer.getChannelData(0).slice();
+    let s = 0;
+    for (let i = 0; i < f32.length; i++) s += f32[i] * f32[i];
+    if (Math.sqrt(s / f32.length) < 0.001) return; // skip silence
+
+    replayBufs.push(f32);
+
+    if (appState === 'recording') {
+      audioQueue.push(f32); // hold for release
+    } else if (appState === 'translating' || appState === 'playing') {
+      scheduleChunk(f32);   // play immediately
+      if (appState === 'translating') setState('playing');
+      lastEvMs = Date.now();
+    }
   };
+}
+
+function scheduleChunk(f32) {
+  const buf = capAudioCtx.createBuffer(1, f32.length, 24000);
+  buf.copyToChannel(f32, 0);
+  const src = capAudioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(capAudioCtx.destination);
+  // Start right after the previous chunk (or immediately if we've fallen behind)
+  const t = Math.max(capAudioCtx.currentTime + 0.02, nextPlayTime);
+  src.start(t);
+  nextPlayTime = t + buf.duration;
+}
+
+function drainQueue() {
+  nextPlayTime = 0; // schedule from "now"
+  for (const chunk of audioQueue) scheduleChunk(chunk);
+  audioQueue = [];
 }
 
 // ── Push-to-talk ───────────────────────────────────────────────────────────────
@@ -408,6 +434,7 @@ function startRecord() {
   if (!['idle','translating','playing'].includes(appState)) return;
   transcript  = '';
   replayBufs  = [];
+  audioQueue  = [];
   copyBtn.style.display = 'none';
   copyBtn.textContent   = 'Copy translation';
   micTrack.enabled = true;
@@ -422,6 +449,7 @@ function stopRecord() {
   lastEvMs  = Date.now();
   setState('translating');
   talkBtn.classList.remove('recording');
+  drainQueue(); // play everything that arrived while the button was held
 }
 
 // ── Replay ─────────────────────────────────────────────────────────────────────
@@ -588,8 +616,8 @@ function cleanup() {
   micAnalyser = null;
   if (capNode)     { capNode.disconnect(); capNode = null; }
   if (capAudioCtx) { try { capAudioCtx.close(); }    catch {} capAudioCtx = null; }
-  if (remoteAudio) { remoteAudio.srcObject = null; remoteAudio = null; }
-  replayBufs = [];
+  replayBufs  = [];
+  audioQueue  = [];
   appState = 'idle';
 }
 
