@@ -6,6 +6,7 @@ Click text to replay.
 
 Input language is auto-detected by the API — you can speak any language.
 Only the output/target language is configured via --lang.
+Note: gpt-realtime-translate does not support voice selection.
 
 Usage:
     python openai_translate.py
@@ -26,6 +27,7 @@ import math
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 
 import numpy as np
@@ -41,12 +43,18 @@ _parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
 )
 _parser.add_argument(
-    "--lang", default="zh", choices=["en", "fr", "zh"],
+    "--lang", default="zh",
+    choices=["en", "fr", "zh", "fi", "es", "it", "pt", "de"],
     help=(
         "Target language (default: zh). Input language is auto-detected.\n"
         "  en  → English\n"
         "  fr  → French\n"
-        "  zh  → Chinese"
+        "  zh  → Chinese\n"
+        "  fi  → Finnish\n"
+        "  es  → Spanish\n"
+        "  it  → Italian\n"
+        "  pt  → Portuguese\n"
+        "  de  → German"
     ),
 )
 _args = _parser.parse_args()
@@ -60,7 +68,16 @@ BAR_N       = 48
 FPS         = 30
 TEXT_H      = 44
 
-LANG_LABEL  = {"en": "→ English (auto)", "fr": "→ Français (auto)", "zh": "→ 中文 (auto)"}
+LANG_LABEL  = {
+    "en": "→ English (auto)",
+    "fr": "→ Français (auto)",
+    "zh": "→ 中文 (auto)",
+    "fi": "→ Suomi (auto)",
+    "es": "→ Español (auto)",
+    "it": "→ Italiano (auto)",
+    "pt": "→ Português (auto)",
+    "de": "→ Deutsch (auto)",
+}
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG = "#0f172a"
@@ -74,7 +91,7 @@ LABELS = {
     "idle":        "Ready  ·  hold right ⌥ to record",
     "recording":   "Recording & translating…",
     "translating": "Finishing…",
-    "playing":     "Replaying…",
+    "playing":     "Playing translation…",
 }
 
 _BAR_TOP = 28
@@ -96,19 +113,27 @@ class OpenAITranslate:
         self._levels     = [0.0] * BAR_N
         self._phase      = 0.0
         self._text       = ""
-        self._audio_out  = []        # full translated audio for replay
+        self._audio_out  = []        # current recording's translated audio for replay
         self._kb         = KBController()
         self._api_key    = api_key
 
-        # queues/events reset on each recording
-        self._tx_q: queue.Queue      = queue.Queue()   # mic → API sender
-        self._rx_q: queue.Queue      = queue.Queue()   # API audio → playback
-        self._stop_tx                = threading.Event()
-        self._stop_playback          = threading.Event()
+        # Persistent connection: one WebSocket for the whole app lifetime, so the
+        # API's dynamic voice adaptation stays consistent and we skip the per-
+        # recording handshake. Recordings are delimited by a generation counter.
+        self._tx_q: queue.Queue = queue.Queue()   # mic → API sender
+        self._rx_q: queue.Queue = queue.Queue()   # API audio → playback, holds (gen, chunk)
+        self._gen          = 0       # bumped per recording; stale rx chunks are skipped
+        self._done_gen     = 0       # highest gen whose playback has fully finished
+        self._connected    = False   # True while the WebSocket session is live
+        self._quitting     = False   # set on window close to unwind background loops
+        self._last_rx      = 0.0     # time of last audio chunk received or played
+        self._release_time = 0.0     # time the hotkey was released
 
         self._build_ui()
         self._start_audio()
         self._start_hotkey()
+        self._start_connection()
+        threading.Thread(target=self._playback_thread, daemon=True).start()
         self._tick()
         self.root.mainloop()
 
@@ -185,7 +210,7 @@ class OpenAITranslate:
     def _audio_cb(self, indata, frames, t, status):
         mono = indata[:, 0]
         self._rms = float(np.sqrt(np.mean(mono ** 2)))
-        if self._recording:
+        if self._recording and self._connected:
             chunk_i16 = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
             self._tx_q.put(chunk_i16)
 
@@ -193,134 +218,158 @@ class OpenAITranslate:
 
     def _start_hotkey(self):
         def on_press(key):
-            if key == HOTKEY and self.state in ("idle", "playing"):
-                # Interrupt any ongoing playback
-                self._stop_playback.set()
-                # Fresh state for new recording
-                self._text          = ""
-                self._audio_out     = []
-                self._tx_q          = queue.Queue()
-                self._rx_q          = queue.Queue()
-                self._stop_tx       = threading.Event()
-                self._stop_playback = threading.Event()
-                self._recording     = True
-                self.state          = "recording"
-                threading.Thread(target=lambda: asyncio.run(self._translate_async()), daemon=True).start()
+            if key == HOTKEY and self.state in ("idle", "translating", "playing"):
+                # New recording: bump generation so any in-flight audio/text from
+                # the previous utterance is treated as stale, and clear buffers.
+                self._gen        += 1
+                self._text        = ""
+                self._audio_out   = []
+                self._recording   = True
+                self.state        = "recording"
 
         def on_release(key):
             if key == HOTKEY and self._recording:
-                self._recording = False
-                self._stop_tx.set()   # signal sender to close
-                self.state = "translating"
-                rx_q       = self._rx_q
-                stop_pb    = self._stop_playback
-                threading.Thread(target=self._playback_thread, args=(rx_q, stop_pb), daemon=True).start()
+                self._recording    = False
+                self._release_time = time.time()
+                self.state         = "translating"
 
         self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self._listener.start()
 
-    # ── Streaming translation ──────────────────────────────────────────────────
+    # ── Persistent translation connection ──────────────────────────────────────
 
-    async def _translate_async(self):
-        # Capture session-scoped state immediately — if the user interrupts and
-        # starts a new recording, self.* will be reassigned but these locals stay
-        # bound to this session's objects.
-        tx_q    = self._tx_q
-        rx_q    = self._rx_q
-        stop_tx = self._stop_tx
-        audio_out = self._audio_out
-        text_parts: list[str] = []
+    def _start_connection(self):
+        threading.Thread(target=lambda: asyncio.run(self._connection_loop()),
+                         daemon=True).start()
 
+    async def _connection_loop(self):
+        """Hold one WebSocket open for the app's lifetime; reconnect on drop."""
+        while not self._quitting:
+            try:
+                await self._run_session()
+            except Exception as e:
+                if not self._quitting:
+                    print(f"[openai_translate] connection lost: {e} — reconnecting in 2s")
+                    self._connected = False
+                    await asyncio.sleep(2)
+
+    async def _run_session(self):
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        try:
-            async with websockets.connect(URL, additional_headers=headers) as ws:
+        async with websockets.connect(URL, additional_headers=headers) as ws:
+            await ws.send(json.dumps({
+                "type": "session.update",
+                "session": {"audio": {"output": {"language": TARGET_LANG}}}
+            }))
+            # Drop any mic audio buffered while disconnected.
+            while not self._tx_q.empty():
+                self._tx_q.get_nowait()
+            self._connected = True
+            try:
+                sender   = asyncio.create_task(self._sender(ws))
+                receiver = asyncio.create_task(self._receiver(ws))
+                done, pending = await asyncio.wait(
+                    {sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()   # re-raise if a task failed
+            finally:
+                self._connected = False
+
+    async def _sender(self, ws):
+        """Stream mic chunks continuously; light silence keepalive while idle."""
+        silence = np.zeros(2400, dtype=np.int16)   # 100 ms @ 24 kHz
+        last_keepalive = time.time()
+        while not self._quitting:
+            sent = False
+            try:
+                while True:
+                    chunk = self._tx_q.get_nowait()
+                    await ws.send(json.dumps({
+                        "type": "session.input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk.tobytes()).decode(),
+                    }))
+                    sent = True
+            except queue.Empty:
+                pass
+            if not sent and not self._recording and time.time() - last_keepalive > 5:
                 await ws.send(json.dumps({
-                    "type": "session.update",
-                    "session": {"audio": {"output": {"language": TARGET_LANG}}}
+                    "type": "session.input_audio_buffer.append",
+                    "audio": base64.b64encode(silence.tobytes()).decode(),
                 }))
+                last_keepalive = time.time()
+            await asyncio.sleep(0.005)
 
-                async def send_audio():
-                    """Stream mic chunks to API; close when key released."""
-                    while True:
-                        try:
-                            chunk = tx_q.get_nowait()
-                            await ws.send(json.dumps({
-                                "type": "session.input_audio_buffer.append",
-                                "audio": base64.b64encode(chunk.tobytes()).decode(),
-                            }))
-                        except queue.Empty:
-                            if stop_tx.is_set():
-                                while not tx_q.empty():
-                                    chunk = tx_q.get_nowait()
-                                    await ws.send(json.dumps({
-                                        "type": "session.input_audio_buffer.append",
-                                        "audio": base64.b64encode(chunk.tobytes()).decode(),
-                                    }))
-                                await ws.send(json.dumps({"type": "session.close"}))
-                                return
-                            await asyncio.sleep(0.01)
-
-                async def receive_events():
-                    """Receive translation; type text live, buffer audio for post-playback."""
-                    async for message in ws:
-                        event = json.loads(message)
-                        t = event.get("type", "")
-                        if t == "session.output_transcript.delta":
-                            delta = event.get("delta", "")
-                            text_parts.append(delta)
-                            self._text += delta   # UI display only; reset on new press
-                            try:
-                                self._kb.type(delta)
-                            except Exception:
-                                pass
-                        elif t == "session.output_audio.delta":
-                            chunk = np.frombuffer(base64.b64decode(event["delta"]), dtype=np.int16)
-                            audio_out.append(chunk.copy())
-                            rx_q.put(chunk)
-                        elif t == "session.closed":
-                            rx_q.put(None)   # sentinel → stop playback thread
-                            break
-
-                await asyncio.gather(send_audio(), receive_events())
-
-        except Exception as e:
-            print(f"[openai_translate] error: {e}")
-            rx_q.put(None)   # unblock playback thread on error
-
-        text = "".join(text_parts).strip()
-        if text:
-            pyperclip.copy(text)
+    async def _receiver(self, ws):
+        """Route translation deltas to the current recording's buffers."""
+        async for message in ws:
+            if self._quitting:
+                break
+            event = json.loads(message)
+            t = event.get("type", "")
+            active = self.state in ("recording", "translating", "playing")
+            if t == "session.output_transcript.delta" and active:
+                delta = event.get("delta", "")
+                self._text += delta
+                try:
+                    self._kb.type(delta)
+                except Exception:
+                    pass
+            elif t == "session.output_audio.delta" and active:
+                chunk = np.frombuffer(base64.b64decode(event["delta"]), dtype=np.int16)
+                self._audio_out.append(chunk.copy())
+                self._rx_q.put((self._gen, chunk))
+                self._last_rx = time.time()
+            elif t == "error":
+                print(f"[event] error: {json.dumps(event)[:200]}")
 
     # ── Audio playback ─────────────────────────────────────────────────────────
 
-    def _playback_thread(self, rx_q: queue.Queue, stop_event: threading.Event):
-        """Play audio chunks as they arrive; stop early if stop_event is set."""
+    def _playback_thread(self):
+        """Persistent: play audio for the current recording once the key is released."""
         with sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
-            first = True
-            while not stop_event.is_set():
-                try:
-                    chunk = rx_q.get(timeout=0.05)
-                except queue.Empty:
+            while not self._quitting:
+                # Hold playback while still recording — the user doesn't want to
+                # hear the translation while they're still speaking.
+                if self.state == "recording":
+                    time.sleep(0.02)
                     continue
-                if chunk is None:
-                    break
-                if first:
+                try:
+                    gen, chunk = self._rx_q.get(timeout=0.1)
+                except queue.Empty:
+                    self._maybe_finish()
+                    continue
+                if gen != self._gen or self._done_gen >= self._gen:
+                    continue   # stale chunk from a finished or superseded recording
+                if self.state == "translating":
                     self.state = "playing"
-                    first = False
                 stream.write((chunk.astype(np.float32) / 32767.0).reshape(-1, 1))
-        if not stop_event.is_set():
-            self.state = "idle"
+                self._last_rx = time.time()
+
+    def _maybe_finish(self):
+        """Transition to idle once a recording's translation has fully drained."""
+        if self.state == "playing" and time.time() - self._last_rx > 0.8:
+            self._finish()
+        elif self.state == "translating" and time.time() - self._release_time > 4.0:
+            self._finish()
+
+    def _finish(self):
+        self._done_gen = self._gen
+        if self._text.strip():
+            pyperclip.copy(self._text.strip())
+        self.state = "idle"
 
     def _replay(self):
         if not self._audio_out or self.state != "idle":
             return
-        audio = np.concatenate(self._audio_out).astype(np.float32) / 32767.0
-        self.state = "playing"
-        def _play():
-            sd.play(audio, samplerate=SAMPLE_RATE)
-            sd.wait()
-            self.state = "idle"
-        threading.Thread(target=_play, daemon=True).start()
+        # Treat replay like a fresh playback generation so the playback thread
+        # accepts the chunks again.
+        self._gen     += 1
+        self._last_rx  = time.time()
+        self.state     = "playing"
+        for chunk in list(self._audio_out):
+            self._rx_q.put((self._gen, chunk))
 
     # ── Render loop ────────────────────────────────────────────────────────────
 
@@ -374,6 +423,7 @@ class OpenAITranslate:
     # ── Quit ───────────────────────────────────────────────────────────────────
 
     def _quit(self):
+        self._quitting = True
         self._stream.stop()
         self._listener.stop()
         self.root.destroy()
