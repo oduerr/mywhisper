@@ -67,8 +67,8 @@ class MyWhisper:
         root.attributes("-topmost", True)
         root.attributes("-alpha", 0.94)
         root.configure(bg=BG)
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"{WIN_W}x{WIN_H}+{sw - WIN_W - 24}+{sh - WIN_H - 90}")
+        sw = root.winfo_screenwidth()
+        root.geometry(f"{WIN_W}x{WIN_H}+{sw - WIN_W - 24}+24")
         self.root = root
 
         cv = tk.Canvas(root, width=WIN_W, height=WIN_H, bg=BG, highlightthickness=0)
@@ -171,15 +171,12 @@ class MyWhisper:
         self.state = "idle"
 
     def _paste(self, text: str):
-        prev = pyperclip.paste()
         pyperclip.copy(text)
         time.sleep(0.05)
         self._kb.press(Key.cmd)
         self._kb.press("v")
         self._kb.release("v")
         self._kb.release(Key.cmd)
-        time.sleep(0.15)
-        pyperclip.copy(prev)
 
     # ── Render loop ────────────────────────────────────────────────────────────
 
