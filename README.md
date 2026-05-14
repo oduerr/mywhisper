@@ -35,12 +35,14 @@ Without this you'll see `This process is not trusted!` and the hotkey won't work
 
 ## openai_translate.py
 
-Real-time German speech translator using the OpenAI Realtime Translate API (`gpt-realtime-translate`). Hold right ⌥, speak German, release — the translation is spoken aloud, pasted at the cursor, and shown in the UI.
+Real-time speech translator using the OpenAI Realtime Translate API (`gpt-realtime-translate`). Hold right ⌥, speak any language, release — the translation is spoken aloud, pasted at the cursor, and shown in the UI.
+
+The input language is **auto-detected** by the API; only the output language is configured:
 
 ```bash
-python openai_translate.py                 # German → Chinese (default)
-python openai_translate.py --lang en       # German → English
-python openai_translate.py --lang fr       # German → French
+python openai_translate.py                 # → Chinese (default)
+python openai_translate.py --lang en       # → English
+python openai_translate.py --lang fr       # → French
 python openai_translate.py --help
 ```
 
