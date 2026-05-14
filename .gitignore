@@ -1,0 +1,10 @@
+recordings/
+benchmark_cache.json
+benchmark_report.html
+
+*.wav
+*.pyc
+__pycache__/
+.DS_Store
+.venv/
+*.egg-info/
