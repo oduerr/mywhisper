@@ -12,6 +12,7 @@ Usage:
 import argparse
 import math
 import threading
+from pathlib import Path
 import time
 import tkinter as tk
 
@@ -74,11 +75,26 @@ LABELS_BASE = {
 }
 
 
+def _find_local_models() -> list:
+    """Return mlx-community whisper models already cached on disk."""
+    cache = Path.home() / ".cache" / "huggingface" / "hub"
+    models = []
+    if cache.exists():
+        for d in sorted(cache.iterdir()):
+            name = d.name
+            if name.startswith("models--mlx-community--whisper-"):
+                repo = name[len("models--"):].replace("--", "/")
+                models.append(repo)
+    return models if models else [MODEL]
+
+
 class MyWhisper:
     def __init__(self):
-        self.state      = "loading"
-        self._task      = TASK            # can be toggled live
-        self._chunks    = []
+        self.state         = "loading"
+        self._model        = MODEL
+        self._local_models = _find_local_models()
+        self._task         = TASK            # can be toggled live
+        self._chunks       = []
         self._recording = False
         self._rms       = 0.0
         self._levels    = [0.0] * BAR_N   # smoothed display levels
@@ -116,10 +132,15 @@ class MyWhisper:
         self._lbl = cv.create_text(PAD + 16, 15, text=LABELS_BASE["loading"],
                                    fill="#475569", font=("Helvetica Neue", 11),
                                    anchor="w")
-        # Model name — right-aligned, dim (shifted left to leave room for →EN toggle)
-        short_model = MODEL.split("/")[-1]
-        self._model_lbl = cv.create_text(WIN_W - 52, 15, text=short_model, fill="#334155",
-                                         font=("Helvetica Neue", 10), anchor="e")
+        # Model name — right-aligned, dim; clickable when multiple local models exist
+        short_model = self._model.split("/")[-1]
+        model_col = "#475569" if len(self._local_models) > 1 else "#334155"
+        self._model_lbl = cv.create_text(WIN_W - 52, 15, text=short_model, fill=model_col,
+                                         font=("Helvetica Neue", 10), anchor="e", tags="model")
+        if len(self._local_models) > 1:
+            cv.tag_bind("model", "<Button-1>", lambda _: self._cycle_model())
+            cv.tag_bind("model", "<Enter>",    lambda _: cv.itemconfig("model", fill="#94a3b8"))
+            cv.tag_bind("model", "<Leave>",    lambda _: cv.itemconfig("model", fill="#475569"))
 
         # Translate toggle
         self._translate_lbl = cv.create_text(WIN_W - 26, 15, text="",
@@ -169,6 +190,16 @@ class MyWhisper:
         else:
             self.cv.itemconfig(self._translate_lbl, text="→EN", fill="#334155")
 
+    def _cycle_model(self):
+        if self.state != "idle" or len(self._local_models) <= 1:
+            return
+        idx = self._local_models.index(self._model) if self._model in self._local_models else 0
+        self._model = self._local_models[(idx + 1) % len(self._local_models)]
+        self._last_time = None
+        self.cv.itemconfig(self._model_lbl, text=self._model.split("/")[-1])
+        self.state = "loading"
+        threading.Thread(target=self._load_model, daemon=True).start()
+
     # ── Audio ──────────────────────────────────────────────────────────────────
 
     def _start_audio(self):
@@ -189,7 +220,7 @@ class MyWhisper:
     def _load_model(self):
         # Warm-up: compiles the graph so first real transcription is fast
         mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32),
-                               path_or_hf_repo=MODEL, task=self._task, verbose=False)
+                               path_or_hf_repo=self._model, task=self._task, verbose=False)
         self._update_translate_lbl()
         self.state = "idle"
 
@@ -220,7 +251,7 @@ class MyWhisper:
         audio = np.concatenate(self._chunks).astype(np.float32)
         try:
             t0 = time.time()
-            result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, task=self._task, verbose=False)
+            result = mlx_whisper.transcribe(audio, path_or_hf_repo=self._model, task=self._task, verbose=False)
             self._last_time = time.time() - t0
             text = result.get("text", "").strip()
             if text:
@@ -293,7 +324,7 @@ class MyWhisper:
         else:
             lbl_text = LABELS_BASE.get(self.state, "")
         self.cv.itemconfig(self._lbl, text=lbl_text, fill=txt_col)
-        short_model = MODEL.split("/")[-1]
+        short_model = self._model.split("/")[-1]
         if self._last_time is not None:
             self.cv.itemconfig(self._model_lbl, text=f"{self._last_time:.1f}s  {short_model}")
         self.root.after(1000 // FPS, self._tick)

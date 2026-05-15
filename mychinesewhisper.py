@@ -192,7 +192,7 @@ class MyChineseWhisper:
 
     # ── Hotkey ─────────────────────────────────────────────────────────────────
 
-    def _start_hotkey(self):
+    def _start_hotkey(self): 
         def on_press(key):
             if key == HOTKEY and self.state == "idle":
                 self._chunks = []
