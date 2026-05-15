@@ -1,6 +1,7 @@
 recordings/
 benchmark_cache.json
 benchmark_report.html
+actions.json
 
 *.wav
 *.pyc
