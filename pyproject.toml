@@ -9,6 +9,8 @@ dependencies = [
     "pynput>=1.8.2",
     "pyperclip>=1.11.0",
     "scipy>=1.17.1",
+    "sentencepiece>=0.2.1",
     "sounddevice>=0.5.5",
     "soundfile>=0.13.1",
+    "transformers>=5.8.1",
 ]

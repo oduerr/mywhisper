@@ -4,8 +4,9 @@ Benchmark mlx_whisper against SuperWhisper on all recordings in ./recordings/.
 Results are cached so reruns skip already-transcribed files.
 
 Usage:
-    python benchmark.py                              # default model
+    python benchmark.py                              # default models
     python benchmark.py --model mlx-community/whisper-large-v3
+    python benchmark.py --model mlx-community/whisper-tiny --model mlx-community/whisper-large-v3-turbo
 """
 
 import argparse
@@ -19,7 +20,10 @@ from pathlib import Path
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 CACHE_FILE = Path(__file__).parent / "benchmark_cache.json"
 REPORT_FILE = Path(__file__).parent / "benchmark_report.html"
-DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_MODELS = [
+    "mlx-community/whisper-large-v3-turbo",
+    "mlx-community/whisper-tiny",
+]
 
 
 def load_cache() -> dict:
@@ -88,17 +92,34 @@ def diff_class(sw_wc: int, mlx_wc: int) -> str:
     return "ok"
 
 
-def build_html(rows: list[dict], model: str) -> str:
+def build_html(rows: list[dict], models: list[str]) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    short_names = [m.split("/")[-1] for m in models]
+
+    # Build per-model header columns
+    model_headers = ""
+    for name in short_names:
+        model_headers += f'  <th>mlx: {name}</th>\n  <th>words</th>\n  <th>time</th>\n  <th>RT×</th>\n'
 
     table_rows = []
     for i, r in enumerate(rows, 1):
         audio_uri = audio_data_uri(r["wav"])
         sw_wc = word_count(r["sw_raw"])
-        mlx_wc = word_count(r["mlx_text"])
-        dc = diff_class(sw_wc, mlx_wc)
-        rt_ratio = round(r["mlx_elapsed"] / (r["duration_ms"] / 1000), 2) if r["duration_ms"] else "?"
         llm_col = f'<td class="text-cell">{r["sw_llm_result"] or "<em>—</em>"}</td>'
+
+        model_cols = ""
+        for m in models:
+            key = f"mlx_{m}"
+            mlx_text = r.get(key + "_text", "<em>—</em>")
+            mlx_elapsed = r.get(key + "_elapsed", 0)
+            mlx_wc = word_count(mlx_text)
+            dc = diff_class(sw_wc, mlx_wc)
+            rt_ratio = round(mlx_elapsed / (r["duration_ms"] / 1000), 2) if r["duration_ms"] and mlx_elapsed else "?"
+            model_cols += f'<td class="text-cell mlx">{mlx_text}</td>'
+            model_cols += f'<td class="{dc}">{mlx_wc}</td>'
+            model_cols += f'<td>{mlx_elapsed}s</td>'
+            model_cols += f'<td class="{dc}">{rt_ratio}×</td>'
+
         row = f"""
         <tr>
           <td class="num">{i}</td>
@@ -109,11 +130,8 @@ def build_html(rows: list[dict], model: str) -> str:
           <td class="lang">{r['language']}</td>
           <td class="text-cell sw">{r['sw_raw']}</td>
           {llm_col}
-          <td class="text-cell mlx">{r['mlx_text']}</td>
-          <td class="{dc}">{sw_wc}</td>
-          <td class="{dc}">{mlx_wc}</td>
-          <td>{r['mlx_elapsed']}s</td>
-          <td class="{dc}">{rt_ratio}×</td>
+          <td class="ok">{sw_wc}</td>
+          {model_cols}
           <td><audio controls preload="none" src="{audio_uri}"></audio></td>
         </tr>"""
         table_rows.append(row)
@@ -134,7 +152,7 @@ def build_html(rows: list[dict], model: str) -> str:
   tr:hover td {{ background: #f0f4ff; }}
   .num {{ color: #999; width: 28px; }}
   .date {{ white-space: nowrap; color: #555; }}
-  .text-cell {{ max-width: 280px; }}
+  .text-cell {{ max-width: 260px; }}
   .text-cell.sw {{ background: #fafff8; }}
   .text-cell.mlx {{ background: #f8f8ff; }}
   .model-cell {{ font-size: 11px; color: #444; }}
@@ -143,7 +161,7 @@ def build_html(rows: list[dict], model: str) -> str:
   .ok {{ color: #2a7; }}
   .med-diff {{ color: #b80; font-weight: bold; }}
   .big-diff {{ color: #c00; font-weight: bold; }}
-  audio {{ width: 220px; height: 32px; }}
+  audio {{ width: 200px; height: 32px; }}
   .legend {{ margin-top: 12px; font-size: 11px; color: #666; }}
   .legend span {{ display: inline-block; margin-right: 16px; }}
 </style>
@@ -153,7 +171,7 @@ def build_html(rows: list[dict], model: str) -> str:
 <div class="meta">
   Generated: {now} &nbsp;|&nbsp;
   Recordings: {len(rows)} &nbsp;|&nbsp;
-  mlx_whisper model: <strong>{model}</strong>
+  Models: <strong>{", ".join(short_names)}</strong>
 </div>
 <table>
 <thead>
@@ -166,11 +184,8 @@ def build_html(rows: list[dict], model: str) -> str:
   <th>Lang</th>
   <th>SuperWhisper (raw)</th>
   <th>SuperWhisper (LLM)</th>
-  <th>mlx_whisper</th>
   <th>SW words</th>
-  <th>MLX words</th>
-  <th>MLX time</th>
-  <th>RT ratio</th>
+  {model_headers}
   <th>Audio</th>
 </tr>
 </thead>
@@ -190,41 +205,50 @@ def build_html(rows: list[dict], model: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="mlx_whisper HF model repo")
+    parser.add_argument("--model", action="append", dest="models", metavar="HF_REPO",
+                        help="mlx_whisper HF model repo (can be repeated for multi-model comparison)")
     args = parser.parse_args()
+    models = args.models or DEFAULT_MODELS
 
     print(f"Scanning {RECORDINGS_DIR} ...")
     candidates = get_candidates()
     print(f"Found {len(candidates)} recordings with content and audio.")
+    print(f"Models: {models}")
 
     cache = load_cache()
-    cached_results = cache.get(args.model, {})
 
+    # Collect results for all models
     rows = []
     for i, rec in enumerate(candidates, 1):
         folder = rec["folder"]
-        if folder in cached_results:
-            mlx_text = cached_results[folder]["mlx_text"]
-            mlx_elapsed = cached_results[folder]["mlx_elapsed"]
-            print(f"  [{i}/{len(candidates)}] {folder} (cached)")
-        else:
-            print(f"  [{i}/{len(candidates)}] {folder} ...", end=" ", flush=True)
-            try:
-                mlx_text, mlx_elapsed = transcribe_with_mlx(rec["wav"], args.model)
-                print(f"{mlx_elapsed}s — {mlx_text[:60]!r}")
-            except Exception as e:
-                print(f"ERROR: {e}")
-                mlx_text, mlx_elapsed = f"[ERROR: {e}]", 0.0
-            cached_results[folder] = {"mlx_text": mlx_text, "mlx_elapsed": mlx_elapsed}
-            cache[args.model] = cached_results
-            save_cache(cache)
-
-        rows.append({**rec, "mlx_text": mlx_text, "mlx_elapsed": mlx_elapsed})
+        row = dict(rec)
+        for model in models:
+            cached_model = cache.get(model, {})
+            key = f"mlx_{model}"
+            if folder in cached_model:
+                row[key + "_text"] = cached_model[folder]["mlx_text"]
+                row[key + "_elapsed"] = cached_model[folder]["mlx_elapsed"]
+                print(f"  [{i}/{len(candidates)}] {folder} [{model.split('/')[-1]}] (cached)")
+            else:
+                print(f"  [{i}/{len(candidates)}] {folder} [{model.split('/')[-1]}] ...", end=" ", flush=True)
+                try:
+                    mlx_text, mlx_elapsed = transcribe_with_mlx(rec["wav"], model)
+                    print(f"{mlx_elapsed}s — {mlx_text[:60]!r}")
+                except Exception as e:
+                    print(f"ERROR: {e}")
+                    mlx_text, mlx_elapsed = f"[ERROR: {e}]", 0.0
+                if model not in cache:
+                    cache[model] = {}
+                cache[model][folder] = {"mlx_text": mlx_text, "mlx_elapsed": mlx_elapsed}
+                save_cache(cache)
+                row[key + "_text"] = mlx_text
+                row[key + "_elapsed"] = mlx_elapsed
+        rows.append(row)
 
     rows.sort(key=lambda r: r["datetime"], reverse=True)
 
     print(f"\nBuilding report ({len(rows)} rows) ...")
-    html = build_html(rows, args.model)
+    html = build_html(rows, models)
     REPORT_FILE.write_text(html, encoding="utf-8")
     print(f"Report saved to: {REPORT_FILE}")
     os.system(f'open "{REPORT_FILE}"')

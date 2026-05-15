@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-mywhisper — hold right-⌘ (right Command) to record, release to transcribe and paste.
-Change HOTKEY below to any pynput Key if you prefer a different key.
+mychinesewhisper — hold right-⌘ to record, release to transcribe and translate to Chinese.
+
+Two-step pipeline (fully offline, no API):
+  1. mlx_whisper  — transcribes speech in original language (fast, Apple Silicon)
+  2. Helsinki-NLP/opus-mt-de-zh — translates German text → Simplified Chinese (~50ms)
 
 Usage:
-    python app.py
-    python app.py --model mlx-community/whisper-large-v3
-    python app.py --help
+    python mychinesewhisper.py
+    python mychinesewhisper.py --model mlx-community/whisper-large-v3-turbo
 """
 
 import argparse
@@ -21,10 +23,11 @@ import sounddevice as sd
 import mlx_whisper
 from pynput import keyboard
 from pynput.keyboard import Controller as KBController, Key
+from transformers import MarianMTModel, MarianTokenizer
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 _parser = argparse.ArgumentParser(
-    description="mywhisper — hold right-⌥ to record and paste transcription at cursor",
+    description="mychinesewhisper — record speech, translate to Chinese, paste at cursor",
     formatter_class=argparse.RawTextHelpFormatter,
 )
 _parser.add_argument(
@@ -35,23 +38,15 @@ _parser.add_argument(
         "Common choices:\n"
         "  mlx-community/whisper-tiny-mlx          (fastest, lowest accuracy)\n"
         "  mlx-community/whisper-small-mlx          (good multilingual, ~0.3s)\n"
-        "  mlx-community/whisper-medium-mlx\n"
-        "  mlx-community/whisper-large-v3-turbo     (recommended, no -mlx suffix)\n"
-        "Browse all: https://huggingface.co/collections/mlx-community/whisper-663256f9964fbb1177db93dc\n"
-        "Note: most MLX models require a '-mlx' suffix (e.g. whisper-small-mlx),\n"
-        "except whisper-large-v3-turbo which has no suffix."
+        "  mlx-community/whisper-large-v3-turbo     (best quality, no -mlx suffix)\n"
     ),
-)
-_parser.add_argument(
-    "--translate", action="store_true", default=False,
-    help="Translate speech to English (instead of transcribing in the original language).",
 )
 _args = _parser.parse_args()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 MODEL       = _args.model
-TASK        = "translate" if _args.translate else "transcribe"
-HOTKEY      = Key.cmd_r          # right Command — easy to hold, rarely conflicts
+MT_MODEL    = "Helsinki-NLP/opus-mt-de-zh"   # German → Simplified Chinese
+HOTKEY      = Key.cmd_r
 SAMPLE_RATE = 16000
 WIN_W       = 360
 WIN_H       = 72
@@ -61,35 +56,35 @@ FPS         = 30
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG   = "#0f172a"
 STATES = {
-    #           dot        status text   bar base
     "loading":      ("#475569", "#475569", "#1e293b"),
     "idle":         ("#22c55e", "#64748b", "#1e3a5f"),
     "recording":    ("#ef4444", "#ef4444", "#7f1d1d"),
     "transcribing": ("#f59e0b", "#f59e0b", "#78350f"),
 }
 LABELS_BASE = {
-    "loading":      "Loading model…",
-    "idle":         "Ready  ·  hold right ⌘ to record",
-    "recording":    "Recording…",
+    "loading":   "Loading models…",
+    "idle":      "Ready  ·  hold right ⌘ to record",
+    "recording": "Recording…",
 }
 
 
-class MyWhisper:
+class MyChineseWhisper:
     def __init__(self):
         self.state      = "loading"
-        self._task      = TASK            # can be toggled live
         self._chunks    = []
         self._recording = False
         self._rms       = 0.0
-        self._levels    = [0.0] * BAR_N   # smoothed display levels
-        self._phase     = 0.0              # animation phase for loading/transcribing
-        self._last_time = None            # seconds taken for last transcription
+        self._levels    = [0.0] * BAR_N
+        self._phase     = 0.0
+        self._last_time = None
         self._kb        = KBController()
+        self._mt_tok    = None   # MarianTokenizer, loaded in background
+        self._mt_model  = None   # MarianMTModel, loaded in background
 
         self._build_ui()
         self._start_audio()
         self._start_hotkey()
-        threading.Thread(target=self._load_model, daemon=True).start()
+        threading.Thread(target=self._load_models, daemon=True).start()
         self._tick()
         self.root.mainloop()
 
@@ -116,24 +111,22 @@ class MyWhisper:
         self._lbl = cv.create_text(PAD + 16, 15, text=LABELS_BASE["loading"],
                                    fill="#475569", font=("Helvetica Neue", 11),
                                    anchor="w")
-        # Model name — right-aligned, dim (shifted left to leave room for →EN toggle)
+        # Model name — right-aligned, dim
         short_model = MODEL.split("/")[-1]
         self._model_lbl = cv.create_text(WIN_W - 52, 15, text=short_model, fill="#334155",
                                          font=("Helvetica Neue", 10), anchor="e")
 
-        # Translate toggle
-        self._translate_lbl = cv.create_text(WIN_W - 26, 15, text="",
-                                             font=("Helvetica Neue", 10), anchor="e", tags="translate")
-        cv.tag_bind("translate", "<Button-1>", lambda _: self._toggle_translate())
-        cv.tag_bind("translate", "<Enter>",    lambda _: cv.itemconfig("translate", fill="#94a3b8"))
-        cv.tag_bind("translate", "<Leave>",    lambda _: self._update_translate_lbl())
+        # Static →ZH indicator (always active — this app always translates to Chinese)
+        self._zh_lbl = cv.create_text(WIN_W - 26, 15, text="→ZH",
+                                      fill="#334155",   # dim until model loaded
+                                      font=("Helvetica Neue", 10), anchor="e")
 
         # Close ×
         cv.create_text(WIN_W - 10, 14, text="×", fill="#334155",
                        font=("Helvetica Neue", 14), anchor="e", tags="close")
-        cv.tag_bind("close", "<Button-1>",  lambda _: self._quit())
-        cv.tag_bind("close", "<Enter>",     lambda _: cv.itemconfig("close", fill="#94a3b8"))
-        cv.tag_bind("close", "<Leave>",     lambda _: cv.itemconfig("close", fill="#334155"))
+        cv.tag_bind("close", "<Button-1>", lambda _: self._quit())
+        cv.tag_bind("close", "<Enter>",    lambda _: cv.itemconfig("close", fill="#94a3b8"))
+        cv.tag_bind("close", "<Leave>",    lambda _: cv.itemconfig("close", fill="#334155"))
 
         # Level bars
         BAR_TOP = 30
@@ -159,16 +152,6 @@ class MyWhisper:
         dx, dy = self._drag
         self.root.geometry(f"+{self.root.winfo_x() + e.x - dx}+{self.root.winfo_y() + e.y - dy}")
 
-    def _toggle_translate(self):
-        self._task = "translate" if self._task == "transcribe" else "transcribe"
-        self._update_translate_lbl()
-
-    def _update_translate_lbl(self):
-        if self._task == "translate":
-            self.cv.itemconfig(self._translate_lbl, text="→EN", fill="#f59e0b")
-        else:
-            self.cv.itemconfig(self._translate_lbl, text="→EN", fill="#334155")
-
     # ── Audio ──────────────────────────────────────────────────────────────────
 
     def _start_audio(self):
@@ -184,14 +167,28 @@ class MyWhisper:
         if self._recording:
             self._chunks.append(mono.copy())
 
-    # ── Model ──────────────────────────────────────────────────────────────────
+    # ── Model loading ──────────────────────────────────────────────────────────
 
-    def _load_model(self):
-        # Warm-up: compiles the graph so first real transcription is fast
+    def _load_models(self):
+        # 1. Warm-up Whisper (compiles MLX graph)
         mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32),
-                               path_or_hf_repo=MODEL, task=self._task, verbose=False)
-        self._update_translate_lbl()
+                               path_or_hf_repo=MODEL, task="transcribe", verbose=False)
+
+        # 2. Load MarianMT translation model (downloads ~300MB on first run, then cached)
+        self._mt_tok   = MarianTokenizer.from_pretrained(MT_MODEL)
+        self._mt_model = MarianMTModel.from_pretrained(MT_MODEL)
+
+        # Light up →ZH indicator
+        self.root.after(0, lambda: self.cv.itemconfig(self._zh_lbl, fill="#22d3ee"))
         self.state = "idle"
+
+    # ── Translation ────────────────────────────────────────────────────────────
+
+    def _to_chinese(self, text: str) -> str:
+        """Translate text to Simplified Chinese via Helsinki-NLP MarianMT."""
+        tokens = self._mt_tok([text], return_tensors="pt", padding=True, truncation=True)
+        out    = self._mt_model.generate(**tokens)
+        return self._mt_tok.decode(out[0], skip_special_tokens=True)
 
     # ── Hotkey ─────────────────────────────────────────────────────────────────
 
@@ -211,7 +208,7 @@ class MyWhisper:
         self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self._listener.start()
 
-    # ── Transcribe & paste ─────────────────────────────────────────────────────
+    # ── Transcribe → translate → paste ────────────────────────────────────────
 
     def _transcribe(self):
         if not self._chunks:
@@ -219,14 +216,16 @@ class MyWhisper:
             return
         audio = np.concatenate(self._chunks).astype(np.float32)
         try:
-            t0 = time.time()
-            result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, task=self._task, verbose=False)
-            self._last_time = time.time() - t0
-            text = result.get("text", "").strip()
-            if text:
-                self._paste(text)
+            t0     = time.time()
+            result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL,
+                                            task="transcribe", verbose=False)
+            german = result.get("text", "").strip()
+            if german:
+                chinese = self._to_chinese(german)
+                self._last_time = time.time() - t0
+                self._paste(chinese)
         except Exception as e:
-            print(f"[mywhisper] transcription error: {e}")
+            print(f"[mychinesewhisper] error: {e}")
         self.state = "idle"
 
     def _paste(self, text: str):
@@ -249,7 +248,6 @@ class MyWhisper:
         bar_max = BAR_BOT - BAR_TOP
 
         if self.state in ("loading", "transcribing"):
-            # Animated sine wave
             for i, bar in enumerate(self._bars):
                 wave = 0.5 + 0.5 * math.sin(math.radians(self._phase + i * (360 / BAR_N)))
                 h    = max(2, int(wave * bar_max * 0.55))
@@ -258,11 +256,7 @@ class MyWhisper:
                 self.cv.coords(bar, x0, BAR_BOT - h, x1, BAR_BOT)
                 self.cv.itemconfig(bar, fill=bar_base)
         else:
-            # Live level meter — smooth towards current RMS
             rms = self._rms
-            self._levels = [v * 0.75 + (rms if i == BAR_N - 1 else self._levels[min(i + 1, BAR_N - 1)]) * 0.25
-                            for i, v in enumerate(self._levels)]
-            # Scroll: push new value in at right
             self._levels = self._levels[1:] + [self._levels[-1] * 0.8 + rms * 0.2]
 
             for i, (bar, level) in enumerate(zip(self._bars, self._levels)):
@@ -272,14 +266,12 @@ class MyWhisper:
                 self.cv.coords(bar, x0, BAR_BOT - h, x1, BAR_BOT)
 
                 if self.state == "recording":
-                    # Green → red gradient based on level
                     t   = min(1.0, level * 22)
                     r   = int(34  + (239 - 34)  * t)
                     g   = int(197 - (197 - 68)  * t)
                     b   = int(94  - 94           * t)
                     col = f"#{r:02x}{g:02x}{b:02x}"
                 else:
-                    # Idle: dim blue, brighter with level
                     t   = min(1.0, level * 22)
                     r   = int(30  + 44  * t)
                     g   = int(58  + 96  * t)
@@ -289,7 +281,7 @@ class MyWhisper:
 
         self.cv.itemconfig(self._dot, fill=dot_col)
         if self.state == "transcribing":
-            lbl_text = "Translating…" if self._task == "translate" else "Transcribing…"
+            lbl_text = "Translating → 中文…"
         else:
             lbl_text = LABELS_BASE.get(self.state, "")
         self.cv.itemconfig(self._lbl, text=lbl_text, fill=txt_col)
@@ -307,4 +299,4 @@ class MyWhisper:
 
 
 if __name__ == "__main__":
-    MyWhisper()
+    MyChineseWhisper()
