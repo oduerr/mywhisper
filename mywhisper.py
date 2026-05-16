@@ -18,6 +18,8 @@ import threading
 from pathlib import Path
 import time
 import tkinter as tk
+from tkinter import ttk
+import webbrowser
 
 import numpy as np
 import pyperclip
@@ -56,6 +58,7 @@ _args = _parser.parse_args()
 MODEL       = _args.model
 TASK        = "translate" if _args.translate else "transcribe"
 ACTIONS_FILE = Path(__file__).with_name("actions.json")
+GITHUB_URL   = "https://github.com/oduerr/mywhisper"
 HOTKEY      = Key.cmd_r          # right Command — easy to hold, rarely conflicts
 SAMPLE_RATE = 16000
 WIN_W       = 360
@@ -194,9 +197,11 @@ class MyWhisper:
         self._recording = False
         self._rms       = 0.0
         self._levels    = [0.0] * BAR_N   # smoothed display levels
-        self._phase     = 0.0              # animation phase for loading/transcribing
-        self._last_time = None            # seconds taken for last transcription
-        self._kb        = KBController()
+        self._phase        = 0.0              # animation phase for loading/transcribing
+        self._last_time    = None            # seconds taken for last transcription
+        self._cur_scale    = 1.0             # current animated window scale (1.0 = normal)
+        self._shrink_after = 0.0             # timestamp after which to start shrinking
+        self._kb           = KBController()
 
         self._build_ui()
         self._reload_actions(force=True)
@@ -215,8 +220,11 @@ class MyWhisper:
         root.attributes("-alpha", 0.94)
         root.configure(bg=BG)
         sw = root.winfo_screenwidth()
-        root.geometry(f"{WIN_W}x{WIN_H}+{sw - WIN_W - 24}+24")
+        sh = root.winfo_screenheight()
+        root.geometry(f"{WIN_W}x{WIN_H}+{sw - WIN_W - 24}+{sh - WIN_H - 24}")
         self.root = root
+        self._sw = sw
+        self._sh = sh
 
         cv = tk.Canvas(root, width=WIN_W, height=WIN_H, bg=BG, highlightthickness=0)
         cv.pack()
@@ -232,7 +240,7 @@ class MyWhisper:
         # Model name — right-aligned, dim; clickable when multiple local models exist
         short_model = self._model.split("/")[-1]
         model_col = "#475569" if len(self._local_models) > 1 else "#334155"
-        self._model_lbl = cv.create_text(WIN_W - 52, 15, text=short_model, fill=model_col,
+        self._model_lbl = cv.create_text(WIN_W - 68, 15, text=short_model, fill=model_col,
                                          font=("Helvetica Neue", 10), anchor="e", tags="model")
         if len(self._local_models) > 1:
             cv.tag_bind("model", "<Button-1>", lambda _: self._cycle_model())
@@ -240,11 +248,18 @@ class MyWhisper:
             cv.tag_bind("model", "<Leave>",    lambda _: cv.itemconfig("model", fill="#475569"))
 
         # Translate toggle
-        self._translate_lbl = cv.create_text(WIN_W - 26, 15, text="",
+        self._translate_lbl = cv.create_text(WIN_W - 40, 15, text="",
                                              font=("Helvetica Neue", 10), anchor="e", tags="translate")
         cv.tag_bind("translate", "<Button-1>", lambda _: self._toggle_translate())
         cv.tag_bind("translate", "<Enter>",    lambda _: cv.itemconfig("translate", fill="#94a3b8"))
         cv.tag_bind("translate", "<Leave>",    lambda _: self._update_translate_lbl())
+
+        # Gear icon — opens settings
+        cv.create_text(WIN_W - 24, 15, text="⚙", fill="#334155",
+                       font=("Helvetica Neue", 12), anchor="e", tags="gear")
+        cv.tag_bind("gear", "<Button-1>", lambda _: self._open_settings())
+        cv.tag_bind("gear", "<Enter>",    lambda _: cv.itemconfig("gear", fill="#94a3b8"))
+        cv.tag_bind("gear", "<Leave>",    lambda _: cv.itemconfig("gear", fill="#334155"))
 
         # Close ×
         cv.create_text(WIN_W - 10, 14, text="×", fill="#334155",
@@ -273,6 +288,10 @@ class MyWhisper:
         cv.bind("<ButtonPress-1>", lambda e: setattr(self, "_drag", (e.x, e.y)))
         cv.bind("<B1-Motion>",     self._on_drag)
 
+        # Right-click opens settings
+        cv.bind("<Button-2>", lambda e: self._open_settings())
+        cv.bind("<Button-3>", lambda e: self._open_settings())
+
     def _on_drag(self, e):
         dx, dy = self._drag
         self.root.geometry(f"+{self.root.winfo_x() + e.x - dx}+{self.root.winfo_y() + e.y - dy}")
@@ -296,6 +315,127 @@ class MyWhisper:
         self.cv.itemconfig(self._model_lbl, text=self._model.split("/")[-1])
         self.state = "loading"
         threading.Thread(target=self._load_model, daemon=True).start()
+
+    def _open_settings(self):
+        # Singleton — raise existing window if already open
+        if hasattr(self, "_settings_win") and self._settings_win and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            self._settings_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("mywhisper Settings")
+        win.configure(bg="#0f172a")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        self._settings_win = win
+
+        # ── ttk dark style ────────────────────────────────────────────────────
+        style = ttk.Style(win)
+        style.theme_use("clam")
+        for name, cfg in {
+            "Dark.TFrame":       {"background": "#0f172a"},
+            "Head.TLabel":       {"background": "#0f172a", "foreground": "#e2e8f0",
+                                  "font": ("Helvetica Neue", 13, "bold")},
+            "Dark.TLabel":       {"background": "#0f172a", "foreground": "#94a3b8",
+                                  "font": ("Helvetica Neue", 12)},
+            "Key.TLabel":        {"background": "#0f172a", "foreground": "#cbd5e1",
+                                  "font": ("Helvetica Neue", 11, "bold")},
+            "Desc.TLabel":       {"background": "#0f172a", "foreground": "#64748b",
+                                  "font": ("Helvetica Neue", 11)},
+            "Dark.TCheckbutton": {"background": "#0f172a", "foreground": "#94a3b8",
+                                  "font": ("Helvetica Neue", 12)},
+        }.items():
+            style.configure(name, **cfg)
+        style.configure("Dark.TButton", background="#1e293b", foreground="#94a3b8",
+                        font=("Helvetica Neue", 11), borderwidth=0, relief="flat")
+        style.map("Dark.TButton", background=[("active", "#334155")])
+        style.configure("Dark.TCombobox", fieldbackground="#1e293b", background="#1e293b",
+                        foreground="#e2e8f0", selectbackground="#1e293b", selectforeground="#e2e8f0")
+        style.map("Dark.TCombobox", fieldbackground=[("readonly", "#1e293b")],
+                  foreground=[("readonly", "#e2e8f0")])
+        style.configure("TSeparator", background="#1e293b")
+
+        row = 0
+
+        # ── Settings ─────────────────────────────────────────────────────────
+        ttk.Label(win, text="Settings", style="Head.TLabel").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 6))
+        row += 1
+
+        ttk.Label(win, text="Model", style="Dark.TLabel").grid(
+            row=row, column=0, sticky="w", padx=(16, 8), pady=4)
+        model_var = tk.StringVar(value=self._model)
+        combo = ttk.Combobox(win, textvariable=model_var, values=self._local_models,
+                             state="readonly", width=36, style="Dark.TCombobox")
+        combo.grid(row=row, column=1, sticky="w", padx=(0, 16), pady=4)
+        row += 1
+
+        def _on_model_change(event=None):
+            new_model = model_var.get()
+            if new_model != self._model and self.state == "idle":
+                self._model = new_model
+                self.cv.itemconfig(self._model_lbl, text=self._model.split("/")[-1])
+                self._last_time = None
+                self.state = "loading"
+                threading.Thread(target=self._load_model, daemon=True).start()
+        combo.bind("<<ComboboxSelected>>", _on_model_change)
+
+        translate_var = tk.BooleanVar(value=self._task == "translate")
+
+        def _on_translate_toggle():
+            self._task = "translate" if translate_var.get() else "transcribe"
+            self._update_translate_lbl()
+
+        ttk.Checkbutton(win, text="Translate to English", variable=translate_var,
+                        command=_on_translate_toggle, style="Dark.TCheckbutton").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 8))
+        row += 1
+
+        # ── Separator ────────────────────────────────────────────────────────
+        ttk.Separator(win, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", padx=16, pady=2)
+        row += 1
+
+        # ── Help / Shortcuts ─────────────────────────────────────────────────
+        ttk.Label(win, text="Keyboard Shortcuts", style="Head.TLabel").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 4))
+        row += 1
+
+        shortcuts = [
+            ("Hold right ⌘",           "Record audio"),
+            ("Click ⚙  or right-click", "Open settings"),
+            ("Click →EN",              "Toggle translate to English"),
+            ("Click model name",        "Cycle to next cached model"),
+            ("Click ×",                "Quit"),
+        ]
+        for key, desc in shortcuts:
+            ttk.Label(win, text=key, style="Key.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(16, 12), pady=2)
+            ttk.Label(win, text=desc, style="Desc.TLabel").grid(
+                row=row, column=1, sticky="w", padx=(0, 16), pady=2)
+            row += 1
+
+        # ── Separator ────────────────────────────────────────────────────────
+        ttk.Separator(win, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", padx=16, pady=8)
+        row += 1
+
+        # ── Bottom buttons ───────────────────────────────────────────────────
+        ttk.Button(win, text="GitHub ↗", style="Dark.TButton",
+                   command=lambda: webbrowser.open(GITHUB_URL)).grid(
+            row=row, column=0, sticky="w", padx=16, pady=(0, 14))
+        ttk.Button(win, text="Close", style="Dark.TButton",
+                   command=win.destroy).grid(
+            row=row, column=1, sticky="e", padx=16, pady=(0, 14))
+
+        # Position above the overlay (overlay is anchored bottom-right)
+        win.update_idletasks()
+        ox, oy = self.root.winfo_x(), self.root.winfo_y()
+        win_h = win.winfo_reqheight()
+        win.geometry(f"+{ox}+{max(0, oy - win_h - 4)}")
+        win.lift()
+        win.focus_force()
 
     # ── Audio ──────────────────────────────────────────────────────────────────
 
@@ -469,13 +609,44 @@ class MyWhisper:
 
     def _tick(self):
         self._phase = (self._phase + 4) % 360
-        dot_col, txt_col, bar_base = STATES[self.state]
-        PAD     = self._PAD
-        BAR_TOP = self._BAR_TOP
-        BAR_BOT = self._BAR_BOT
-        bar_w   = self._BAR_W
+
+        # ── Window scale animation ─────────────────────────────────────────
+        now = time.time()
+        if self.state in ("recording", "transcribing"):
+            self._shrink_after = now + 1.0   # keep large for 1 s after state ends
+            target_scale = 2.0
+        elif now < self._shrink_after:
+            target_scale = 2.0               # hold period after transcription
+        else:
+            target_scale = 1.0
+        self._cur_scale += (target_scale - self._cur_scale) * 0.15
+        s = self._cur_scale
+
+        # ── Resize window, anchored to bottom-right corner ─────────────────
+        cw = max(1, int(WIN_W * s))
+        ch = max(1, int(WIN_H * s))
+        self.root.geometry(f"{cw}x{ch}+{self._sw - cw - 24}+{self._sh - ch - 24}")
+        self.cv.configure(width=cw, height=ch)
+
+        # ── Scaled layout constants ────────────────────────────────────────
+        PAD     = 14 * s
+        BAR_TOP = 30 * s
+        BAR_BOT = (WIN_H - 8) * s
+        bar_w   = (WIN_W - 28) * s / BAR_N   # 28 = 2 * PAD_BASE
         bar_max = BAR_BOT - BAR_TOP
 
+        # ── Reposition header elements ─────────────────────────────────────
+        dot_col, txt_col, bar_base = STATES[self.state]
+        self.cv.coords(self._dot, PAD, 11 * s, PAD + 9 * s, 20 * s)
+        self.cv.coords(self._lbl, PAD + 16 * s, 15 * s)
+        self.cv.coords(self._model_lbl, (WIN_W - 68) * s, 15 * s)
+        self.cv.coords(self._translate_lbl, (WIN_W - 40) * s, 15 * s)
+        for tag, rx, ry in (("gear", WIN_W - 24, 15), ("close", WIN_W - 10, 14)):
+            items = self.cv.find_withtag(tag)
+            if items:
+                self.cv.coords(items[0], rx * s, ry * s)
+
+        # ── Bar drawing ────────────────────────────────────────────────────
         if self.state in ("loading", "transcribing"):
             # Animated sine wave
             for i, bar in enumerate(self._bars):
