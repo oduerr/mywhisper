@@ -201,6 +201,10 @@ class MyWhisper:
         self._last_time    = None            # seconds taken for last transcription
         self._cur_scale    = 1.0             # current animated window scale (1.0 = normal)
         self._shrink_after = 0.0             # timestamp after which to start shrinking
+        self._launcher_mode = False          # True while waiting for a launcher keypress
+        self._launcher_keys: dict = {}       # char → action, built by _assign_launcher_keys
+        self._launcher_win  = None
+        self._press_time    = 0.0
         self._kb           = KBController()
 
         self._build_ui()
@@ -404,6 +408,7 @@ class MyWhisper:
 
         shortcuts = [
             ("Hold right ⌘",           "Record audio"),
+            ("Tap right ⌘",            "Open action launcher"),
             ("Click ⚙  or right-click", "Open settings"),
             ("Click →EN",              "Toggle translate to English"),
             ("Click model name",        "Cycle to next cached model"),
@@ -491,6 +496,7 @@ class MyWhisper:
                             "target": target,
                             "paste_result": bool(action.get("paste_result", False)),
                             "new_chat": bool(action.get("new_chat", False)),
+                            "key": str(action.get("key", "")).strip().lower()[:1],
                         }
                     )
             self._actions = loaded
@@ -499,9 +505,31 @@ class MyWhisper:
                 for wake_word in wake_words
                 if _normalize_command_text(str(wake_word))
             ]
+            self._actions = loaded
+            self._assign_launcher_keys()
             self._actions_mtime = mtime
         except Exception as e:
             print(f"[mywhisper] actions.json error: {e}")
+
+    def _assign_launcher_keys(self):
+        """Auto-assign a single letter to each action for the tap launcher."""
+        used: set = set()
+        for action in self._actions:
+            explicit = action.get("key", "").strip().lower()
+            if explicit and explicit.isalpha() and explicit not in used:
+                action["_key"] = explicit
+                used.add(explicit)
+                continue
+            # Auto-assign: first unused letter in the label
+            assigned = None
+            for ch in action.get("label", "").lower():
+                if ch.isalpha() and ch not in used:
+                    assigned = ch
+                    break
+            action["_key"] = assigned
+            if assigned:
+                used.add(assigned)
+        self._launcher_keys = {a["_key"]: a for a in self._actions if a.get("_key")}
 
     def _match_action(self, text: str):
         haystack = _normalize_command_text(text)
@@ -560,7 +588,12 @@ class MyWhisper:
 
     def _start_hotkey(self):
         def on_press(key):
+            # Launcher mode: route all keys through the launcher (pynput-side, no focus needed)
+            if self._launcher_mode:
+                self.root.after(0, lambda k=key: self._launcher_key(k))
+                return
             if key == HOTKEY and self.state == "idle":
+                self._press_time = time.time()
                 self._chunks = []
                 self._recording = True
                 self.state = "recording"
@@ -568,11 +601,93 @@ class MyWhisper:
         def on_release(key):
             if key == HOTKEY and self._recording:
                 self._recording = False
-                self.state = "transcribing"
-                threading.Thread(target=self._transcribe, daemon=True).start()
+                duration = time.time() - self._press_time
+                if duration < 0.35 and self._launcher_keys:
+                    # Short tap → open launcher instead of transcribing
+                    self._launcher_mode = True
+                    self.root.after(0, self._open_launcher)
+                else:
+                    # Hold → transcribe as normal
+                    self.state = "transcribing"
+                    threading.Thread(target=self._transcribe, daemon=True).start()
 
         self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self._listener.start()
+
+    # ── Launcher ───────────────────────────────────────────────────────────────
+
+    def _open_launcher(self):
+        if self._launcher_win and self._launcher_win.winfo_exists():
+            return
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.96)
+        win.configure(bg=BG)
+        self._launcher_win = win
+
+        ROW_H = 28
+        PAD   = 12
+        items = [(a["_key"], a["label"]) for a in self._actions if a.get("_key")]
+        # Width based on longest label
+        max_label = max((len(lbl) for _, lbl in items), default=10)
+        win_w = max(200, PAD + 34 + max_label * 7 + PAD)
+        win_h = PAD + len(items) * ROW_H + 20
+
+        cv = tk.Canvas(win, width=win_w, height=win_h, bg=BG, highlightthickness=0)
+        cv.pack()
+
+        for i, (key_char, label) in enumerate(items):
+            y = PAD + i * ROW_H + ROW_H // 2
+            cv.create_text(PAD, y, text=f"[{key_char}]",
+                           fill="#f59e0b", font=("Helvetica Neue", 11, "bold"), anchor="w")
+            cv.create_text(PAD + 32, y, text=label,
+                           fill="#e2e8f0", font=("Helvetica Neue", 11), anchor="w")
+
+        cv.create_text(win_w // 2, win_h - 5, text="esc · cancel",
+                       fill="#334155", font=("Helvetica Neue", 9), anchor="s")
+
+        # Center on screen
+        win.update_idletasks()
+        ox = (self._sw - win_w) // 2
+        oy = (self._sh - win_h) // 2
+        win.geometry(f"{win_w}x{win_h}+{ox}+{oy}")
+
+        # Auto-close after 6 s if nothing pressed
+        self._launcher_timeout = self.root.after(6000, self._close_launcher)
+
+    def _launcher_key(self, key):
+        if not self._launcher_mode:
+            return
+        if key == keyboard.Key.esc:
+            self._close_launcher()
+            return
+        char = getattr(key, "char", None)
+        if char:
+            action = self._launcher_keys.get(char.lower())
+            if action:
+                self._close_launcher()
+                threading.Thread(target=self._run_action, args=(action, "", ""), daemon=True).start()
+                return
+        # Unmapped key → dismiss
+        self._close_launcher()
+
+    def _close_launcher(self):
+        self._launcher_mode = False
+        if hasattr(self, "_launcher_timeout"):
+            try:
+                self.root.after_cancel(self._launcher_timeout)
+            except Exception:
+                pass
+        if self._launcher_win:
+            try:
+                self._launcher_win.destroy()
+            except Exception:
+                pass
+            self._launcher_win = None
+        # Discard the tiny audio captured during the tap
+        self._chunks = []
+        self.state = "idle"
 
     # ── Transcribe & paste ─────────────────────────────────────────────────────
 
